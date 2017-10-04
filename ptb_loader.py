@@ -82,16 +82,26 @@ class PTBLoader():
 
         self.num_lines = [len(target) for target in self.data]
 
-        with open(self.idx_file, 'wb') as f:
-            cPickle.dump(self.idx_to_char, f)
-
         self.data = [[[self.char_to_idx[char]
                        for char in line]
                       for line in target]
                      for target in self.data]
 
+        with open(self.idx_file, 'wb') as f:
+            cPickle.dump(self.idx_to_char, f)
+
         with open(self.tensor_file, 'wb') as f:
             cPickle.dump(self.data, f)
 
     def load_preprocessed(self):
-        pass
+
+        self.idx_to_char = cPickle.load(open(self.idx_file, "rb"))
+        self.vocab_size = len(self.idx_to_char)
+        self.char_to_idx = dict(zip(self.idx_to_char, range(self.vocab_size)))
+
+        self.data = cPickle.load(open(self.tensor_file, "rb"))
+
+        self.num_lines = [len(target) for target in self.data]
+
+
+

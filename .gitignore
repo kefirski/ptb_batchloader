@@ -19,6 +19,7 @@ lib/
 lib64/
 experimentation.py
 preprocessings/
+.idea/
 parts/
 sdist/
 var/

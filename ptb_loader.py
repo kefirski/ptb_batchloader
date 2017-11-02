@@ -1,8 +1,12 @@
+import ast
 import collections
 import os
 
 import numpy as np
+import pandas as pnd
+import torch as t
 from six.moves import cPickle
+from torch.autograd import Variable
 
 
 class PTBLoader():
@@ -25,12 +29,11 @@ class PTBLoader():
         go_token (stop_token) uses to mark start (end) of the sequence
         pad_token uses to fill tensor to fixed-size length
         '''
-        self.go_token = '>'
+        self.go_token = '~'
         self.pad_token = '_'
-        self.stop_token = '<'
+        self.stop_token = '|'
 
         self.data_files = [data_path + path for path in ['ptb.test.txt', 'ptb.train.txt', 'ptb.valid.txt']]
-        self.target_idx = {'test': 0, 'train': 1, 'valid': 2}
 
         self.idx_file = self.preprocessings_path + 'ptb_vocab.pkl'
         self.tensor_file = self.preprocessings_path + 'tensor.pkl'
@@ -65,7 +68,7 @@ class PTBLoader():
         char_counts = collections.Counter(sentences)
 
         idx_to_char = [x[0] for x in char_counts.most_common()]
-        idx_to_char = [self.go_token, self.stop_token, self.pad_token] + list(sorted(idx_to_char))
+        idx_to_char = [self.pad_token, self.go_token, self.stop_token] + list(sorted(idx_to_char))
 
         char_to_idx = {x: i for i, x in enumerate(idx_to_char)}
 
@@ -75,18 +78,24 @@ class PTBLoader():
 
     def preprocess(self):
 
-        self.data = [open(file, "r").read() for file in self.data_files]
+        data = [open(file, "r").read() for file in self.data_files]
 
-        self.vocab_size, self.idx_to_char, self.char_to_idx = self.build_vocab(' '.join(self.data))
+        self.vocab_size, self.idx_to_char, self.char_to_idx = self.build_vocab(' '.join(data))
 
-        self.data = [[line[1:-1] for line in target.split('\n')[:-1]] for target in self.data]
+        data = [[line[1:-1] for line in target.split('\n')[:-1]] for target in data]
+        self.data = {
+            target: pnd.DataFrame({
+                'text': [self.go_token + line + self.stop_token for line in data[i]],
+                'len': [len(line) for line in data[i]]
+            })
+            for i, target in enumerate(['test', 'train', 'valid'])
+        }
+        del data
 
-        self.num_lines = [len(target) for target in self.data]
-
-        self.data = [[[self.char_to_idx[char]
-                       for char in line]
-                      for line in target]
-                     for target in self.data]
+        for target in self.data:
+            self.data[target]['text'] = self.data[target]['text'].map(
+                lambda line: [self.char_to_idx[char] for char in line]
+            )
 
         with open(self.idx_file, 'wb') as f:
             cPickle.dump(self.idx_to_char, f)
@@ -102,33 +111,32 @@ class PTBLoader():
 
         self.data = cPickle.load(open(self.tensor_file, "rb"))
 
-        self.num_lines = [len(target) for target in self.data]
+        for target in self.data:
+            self.data[target]['text'] = self.data[target]['text'].map(lambda line: ast.literal_eval(line))
 
     def next_batch(self, batch_size, target):
         """
         :param batch_size: number of selected data elements
         :param target: target from ['test', 'train', 'valid']
-        :param use_cuda: whether to use cuda
         :return: target tensors
         """
 
-        target = self.target_idx[target]
-
-        indexes = np.random.randint(self.num_lines[target], size=batch_size)
-        lines = np.array([self.data[target][idx][:] for idx in indexes])
+        indexes = np.random.choice(list(self.data[target].index), size=batch_size)
+        lines = self.data[target].ix[indexes].sort_values('len', ascending=False)
+        lines = list(lines['text'])
         del indexes
 
         return self.construct_batches(lines)
 
-    @staticmethod
-    def sort_sequences(xs):
-        """
-        :param xs: An array of batches with length batch_size
-        :return: Sorted array of batches
-        """
+    def torch_batch(self, batch_size, target, cuda, volatile=False):
 
-        argsort = np.argsort([len(batch) for batch in xs])[::-1]
-        return xs[argsort]
+        (input, lengths), (gen_input, gen_lengths), (target, _) = self.next_batch(batch_size, target)
+        [input, gen_input, target] = [Variable(t.from_numpy(var), volatile=volatile)
+                                      for var in [input, gen_input, target]]
+        if cuda:
+            [input, gen_input, target] = [var.cuda() for var in [input, gen_input, target]]
+
+        return (input, lengths), (gen_input, gen_lengths), target
 
     def construct_batches(self, lines):
         """
@@ -136,11 +144,9 @@ class PTBLoader():
         :return: Batches
         """
 
-        lines = self.sort_sequences(lines)
-
-        encoder_input = [self.add_token(line, go=True, stop=True) for line in lines]
-        decoder_input = [self.add_token(line, go=True) for line in lines]
-        decoder_target = [self.add_token(line, stop=True) for line in lines]
+        encoder_input = lines
+        decoder_input = [line[:-1] for line in lines]
+        decoder_target = [line[1:] for line in lines]
 
         encoder_input = self.padd_sequences(encoder_input)
         decoder_input = self.padd_sequences(decoder_input)
@@ -156,9 +162,21 @@ class PTBLoader():
         return np.array([line + [self.char_to_idx[self.pad_token]] * (max_length - lengths[i])
                          for i, line in enumerate(sequences)]), lengths
 
-    def add_token(self, line, go=False, stop=False):
+    def go_input(self, batch_size, use_cuda):
 
-        go = [self.char_to_idx[self.go_token]] if go else []
-        stop = [self.char_to_idx[self.stop_token]] if stop else []
+        go_input = np.array([[self.char_to_idx[self.go_token]]] * batch_size)
+        go_input = Variable(t.from_numpy(go_input)).long()
 
-        return go + line + stop
+        if use_cuda:
+            go_input = go_input.cuda()
+
+        return go_input
+
+    def sample_char(self, p):
+        """
+        :param p: An array of probabilities
+        :return: An index of sampled from distribution character
+        """
+
+        idx = np.random.choice(len(p), p=p.ravel())
+        return idx, self.idx_to_char[idx]
